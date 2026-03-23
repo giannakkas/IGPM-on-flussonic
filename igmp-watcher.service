@@ -1,0 +1,29 @@
+[Unit]
+Description=IGMP Watcher for Flussonic On-Demand UDP
+Documentation=https://github.com/giannakkas
+After=network.target flussonic.service
+Wants=flussonic.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/igmp-watcher/igmp_watcher.py
+WorkingDirectory=/opt/igmp-watcher
+Restart=always
+RestartSec=5
+
+# Must run as root for raw socket IGMP capture
+User=root
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=igmp-watcher
+
+# Hardening
+NoNewPrivileges=no
+ProtectSystem=strict
+ReadWritePaths=/var/log /opt/igmp-watcher
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

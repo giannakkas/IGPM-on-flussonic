@@ -1,0 +1,34 @@
+[network]
+# LAN interface facing the MAG boxes on the yacht
+# Run 'ip addr' on the Flussonic server to find the right one
+interface = eth0
+
+[flussonic]
+# Flussonic URL (localhost since script runs on same server)
+url = http://localhost:8080
+# Leave empty if no auth required for local access
+user = 
+password = 
+
+[channels]
+# First multicast address (239.0.0.1 = TV1)
+multicast_start = 239.0.0.1
+# Channel name prefix (TV1, TV2, etc.)
+prefix = TV
+# Total number of channels
+count = 120
+
+[timing]
+# How often to poke Flussonic to keep stream alive (seconds)
+# MUST be less than Flussonic's on_demand timeout (30s)
+poke_interval = 20
+# Seconds to wait after IGMP leave before stopping pokes
+# Handles brief channel switches without killing the stream
+leave_grace = 5
+# HTTP request timeout for each poke (seconds)
+poke_timeout = 2
+
+[logging]
+path = /var/log/igmp-watcher.log
+# DEBUG, INFO, WARNING, ERROR
+level = INFO
