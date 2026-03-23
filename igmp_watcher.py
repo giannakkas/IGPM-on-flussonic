@@ -10,6 +10,9 @@ POKE_INTERVAL seconds to prevent the stream from dying.
 When the last MAG leaves the group, poking stops and Flussonic's
 on_demand timeout shuts down the stream.
 
+Supports multiple channel groups (e.g. TV + Radio) with different
+multicast ranges and prefixes.
+
 Requirements:
   - Python 3.6+
   - Must run as root (raw sockets for IGMP sniffing)
@@ -44,9 +47,6 @@ INTERFACE       = config.get('network', 'interface', fallback='eth0')
 FLUSSONIC_BASE  = config.get('flussonic', 'url', fallback='http://localhost:8080')
 FLUSSONIC_USER  = config.get('flussonic', 'user', fallback='')
 FLUSSONIC_PASS  = config.get('flussonic', 'password', fallback='')
-MULTICAST_START = config.get('channels', 'multicast_start', fallback='239.0.0.1')
-CHANNEL_PREFIX  = config.get('channels', 'prefix', fallback='TV')
-NUM_CHANNELS    = config.getint('channels', 'count', fallback=120)
 POKE_INTERVAL   = config.getint('timing', 'poke_interval', fallback=20)
 LEAVE_GRACE     = config.getint('timing', 'leave_grace', fallback=5)
 POKE_TIMEOUT    = config.getint('timing', 'poke_timeout', fallback=2)
@@ -65,28 +65,69 @@ logging.basicConfig(
 )
 log = logging.getLogger('igmp-watcher')
 
-# ── Multicast IP <-> Channel mapping ───────────────────────────
-BASE_IP = list(map(int, MULTICAST_START.split('.')))
+# ── Channel Groups ──────────────────────────────────────────────
+# Each group defines a multicast range -> Flussonic stream name mapping
+# Format: [group:NAME] section in config.ini
+
+class ChannelGroup:
+    def __init__(self, name, prefix, multicast_start, count):
+        self.name = name
+        self.prefix = prefix
+        self.count = count
+        self.base_ip = list(map(int, multicast_start.split('.')))
+    
+    def ip_to_channel(self, ip_str):
+        """Convert multicast IP to channel name, or None if not in this group."""
+        try:
+            parts = list(map(int, ip_str.split('.')))
+            if parts[:3] != self.base_ip[:3]:
+                return None
+            offset = parts[3] - self.base_ip[3]
+            if 0 <= offset < self.count:
+                return f"{self.prefix}{offset + 1}"
+        except (ValueError, IndexError):
+            pass
+        return None
+    
+    def last_ip(self):
+        """Return the last multicast IP in this group's range."""
+        return f"{self.base_ip[0]}.{self.base_ip[1]}.{self.base_ip[2]}.{self.base_ip[3] + self.count - 1}"
+    
+    def first_ip(self):
+        return '.'.join(map(str, self.base_ip))
+
+
+# Load channel groups from config
+channel_groups = []
+
+for section in config.sections():
+    if section.startswith('group:'):
+        group_name = section.split(':', 1)[1]
+        group = ChannelGroup(
+            name=group_name,
+            prefix=config.get(section, 'prefix'),
+            multicast_start=config.get(section, 'multicast_start'),
+            count=config.getint(section, 'count'),
+        )
+        channel_groups.append(group)
+
+# Fallback: if no groups defined, use legacy single-group config
+if not channel_groups:
+    channel_groups.append(ChannelGroup(
+        name='tv',
+        prefix=config.get('channels', 'prefix', fallback='TV'),
+        multicast_start=config.get('channels', 'multicast_start', fallback='239.0.0.1'),
+        count=config.getint('channels', 'count', fallback=120),
+    ))
 
 
 def multicast_ip_to_channel(ip_str):
-    """Convert multicast IP to channel name. 239.0.0.1 -> TV1"""
-    try:
-        parts = list(map(int, ip_str.split('.')))
-        # Check first 3 octets match
-        if parts[:3] != BASE_IP[:3]:
-            return None
-        offset = parts[3] - BASE_IP[3]
-        if 0 <= offset < NUM_CHANNELS:
-            return f"{CHANNEL_PREFIX}{offset + 1}"
-    except (ValueError, IndexError):
-        pass
+    """Try all channel groups to resolve a multicast IP to a stream name."""
+    for group in channel_groups:
+        channel = group.ip_to_channel(ip_str)
+        if channel is not None:
+            return channel
     return None
-
-
-def channel_to_multicast_ip(ch_num):
-    """Convert channel number to multicast IP. 1 -> 239.0.0.1"""
-    return f"{BASE_IP[0]}.{BASE_IP[1]}.{BASE_IP[2]}.{BASE_IP[3] + ch_num - 1}"
 
 
 # ── Flussonic HTTP Poker ────────────────────────────────────────
@@ -126,30 +167,22 @@ class StreamTracker:
 
     def __init__(self):
         self.lock = threading.Lock()
-        # channel_name -> {
-        #   "active": True/False,
-        #   "leave_time": float or None,
-        #   "viewers": int (approximate, for logging)
-        # }
         self.streams = {}
 
     def handle_join(self, channel):
         """Called when an IGMP join/report is detected for a channel."""
         with self.lock:
             if channel not in self.streams:
-                # New stream activation
                 log.info(f"▶ WAKE  {channel} — IGMP join detected, poking Flussonic")
                 self.streams[channel] = {
                     "active": True,
                     "leave_time": None,
                     "viewers": 1,
                 }
-                # Immediate poke in background
                 threading.Thread(target=poke_stream, args=(channel,), daemon=True).start()
             else:
                 info = self.streams[channel]
                 if not info["active"] or info["leave_time"] is not None:
-                    # Was leaving, cancel the leave
                     log.info(f"▶ REJOIN {channel} — cancelled pending shutdown")
                 info["active"] = True
                 info["leave_time"] = None
@@ -183,7 +216,6 @@ class StreamTracker:
             for ch in to_remove:
                 del self.streams[ch]
 
-            # Return channels that are active and not in leave grace
             return [
                 ch for ch, info in self.streams.items()
                 if info["active"] and info["leave_time"] is None
@@ -203,7 +235,6 @@ tracker = StreamTracker()
 
 # ── IGMP Packet Parser ──────────────────────────────────────────
 
-# IGMP message types
 IGMP_V1_REPORT = 0x12
 IGMP_V2_REPORT = 0x16
 IGMP_V2_LEAVE  = 0x17
@@ -222,7 +253,6 @@ def parse_igmp_packet(data):
     if len(data) < 20:
         return results
 
-    # IP header length
     ihl = (data[0] & 0x0F) * 4
 
     if len(data) < ihl + 8:
@@ -231,17 +261,14 @@ def parse_igmp_packet(data):
     igmp_type = data[ihl]
 
     if igmp_type in (IGMP_V1_REPORT, IGMP_V2_REPORT):
-        # V1/V2 Membership Report = JOIN
         group = socket.inet_ntoa(data[ihl + 4:ihl + 8])
         results.append(('join', group))
 
     elif igmp_type == IGMP_V2_LEAVE:
-        # V2 Leave Group
         group = socket.inet_ntoa(data[ihl + 4:ihl + 8])
         results.append(('leave', group))
 
     elif igmp_type == IGMP_V3_REPORT:
-        # V3 Membership Report — contains group records
         if len(data) < ihl + 8:
             return results
         num_records = struct.unpack('!H', data[ihl + 6:ihl + 8])[0]
@@ -256,27 +283,16 @@ def parse_igmp_packet(data):
             num_sources = struct.unpack('!H', data[offset + 2:offset + 4])[0]
             group = socket.inet_ntoa(data[offset + 4:offset + 8])
 
-            # Record types:
-            # 1 = MODE_IS_INCLUDE  (with 0 sources = leave)
-            # 2 = MODE_IS_EXCLUDE  (= join, "exclude nothing" = want everything)
-            # 3 = CHANGE_TO_INCLUDE (with 0 sources = leave)
-            # 4 = CHANGE_TO_EXCLUDE (= join)
-            # 5 = ALLOW_NEW_SOURCES
-            # 6 = BLOCK_OLD_SOURCES
-
             if rec_type in (2, 4, 5):
-                # Join
                 results.append(('join', group))
             elif rec_type in (1, 3, 6):
                 if num_sources == 0 and rec_type in (1, 3):
-                    # Empty INCLUDE = leave
                     results.append(('leave', group))
                 elif rec_type == 6:
                     results.append(('leave', group))
                 else:
                     results.append(('join', group))
 
-            # Advance to next record
             offset += 8 + (num_sources * 4) + (aux_len * 4)
 
     return results
@@ -296,7 +312,6 @@ def igmp_sniffer():
 
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-    # Bind to specific interface
     SO_BINDTODEVICE = 25
     try:
         sock.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, INTERFACE.encode() + b'\0')
@@ -304,9 +319,10 @@ def igmp_sniffer():
     except OSError as e:
         log.warning(f"Could not bind to {INTERFACE}: {e} — listening on all interfaces")
 
-    sock.settimeout(2.0)  # allow periodic checks of 'running' flag
+    sock.settimeout(2.0)
 
-    log.info(f"IGMP sniffer started — watching for groups 239.0.0.1-239.0.0.{NUM_CHANNELS}")
+    for g in channel_groups:
+        log.info(f"Watching: {g.name} → {g.first_ip()}-{g.last_ip()} ({g.prefix}1-{g.prefix}{g.count})")
 
     while running:
         try:
@@ -316,7 +332,7 @@ def igmp_sniffer():
             for action, group_ip in events:
                 channel = multicast_ip_to_channel(group_ip)
                 if channel is None:
-                    continue  # not one of our channels
+                    continue
 
                 if action == 'join':
                     tracker.handle_join(channel)
@@ -335,10 +351,6 @@ def igmp_sniffer():
 
 # ── Keepalive Poker Thread ──────────────────────────────────────
 def keepalive_loop():
-    """
-    Every POKE_INTERVAL seconds, poke all active channels
-    to reset Flussonic's on_demand timer.
-    """
     log.info(f"Keepalive loop started — poking every {POKE_INTERVAL}s")
 
     while running:
@@ -350,13 +362,11 @@ def keepalive_loop():
         if channels:
             log.debug(f"Poking {len(channels)} active channels: {', '.join(channels)}")
             for ch in channels:
-                # Run pokes in parallel threads for speed
                 threading.Thread(target=poke_stream, args=(ch,), daemon=True).start()
 
 
 # ── Status Reporter Thread ──────────────────────────────────────
 def status_reporter():
-    """Periodically log the current state."""
     while running:
         time.sleep(60)
         if not running:
@@ -380,21 +390,23 @@ signal.signal(signal.SIGINT, shutdown)
 
 
 def main():
+    total_channels = sum(g.count for g in channel_groups)
+    
     log.info("=" * 60)
     log.info("IGMP Watcher for Flussonic — Starting")
     log.info(f"  Interface:    {INTERFACE}")
     log.info(f"  Flussonic:    {FLUSSONIC_BASE}")
-    log.info(f"  Channels:     {CHANNEL_PREFIX}1 - {CHANNEL_PREFIX}{NUM_CHANNELS}")
-    log.info(f"  Multicast:    {MULTICAST_START} - {channel_to_multicast_ip(NUM_CHANNELS)}")
+    log.info(f"  Groups:       {len(channel_groups)}")
+    for g in channel_groups:
+        log.info(f"    {g.name}: {g.prefix}1-{g.prefix}{g.count} → {g.first_ip()}-{g.last_ip()}")
+    log.info(f"  Total:        {total_channels} channels")
     log.info(f"  Poke every:   {POKE_INTERVAL}s")
     log.info(f"  Leave grace:  {LEAVE_GRACE}s")
     log.info("=" * 60)
 
-    # Sanity check
     if POKE_INTERVAL >= 30:
         log.warning("POKE_INTERVAL should be less than Flussonic's on_demand timeout (30s)!")
 
-    # Start threads
     threads = [
         threading.Thread(target=keepalive_loop, daemon=True, name="keepalive"),
         threading.Thread(target=status_reporter, daemon=True, name="status"),
@@ -402,7 +414,6 @@ def main():
     for t in threads:
         t.start()
 
-    # Run sniffer in main thread (needs to catch signals)
     igmp_sniffer()
 
     log.info("IGMP Watcher stopped")

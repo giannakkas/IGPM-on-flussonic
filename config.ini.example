@@ -1,29 +1,36 @@
 [network]
-# LAN interface facing the MAG boxes on the yacht
-# Run 'ip addr' on the Flussonic server to find the right one
-interface = eth0
+# LAN interface facing the MAG boxes
+# Run 'ip link show' to find the right one
+interface = ens18
 
 [flussonic]
 # Flussonic URL (localhost since script runs on same server)
 url = http://localhost:8080
 # Leave empty if no auth required for local access
-user = 
-password = 
+user = admin
+password = admin
 
-[channels]
-# First multicast address (239.0.0.1 = TV1)
-multicast_start = 239.0.0.1
-# Channel name prefix (TV1, TV2, etc.)
+# ── Channel Groups ──────────────────────────────────────────────
+# Define as many [group:NAME] sections as needed.
+# Each group maps a multicast IP range to Flussonic stream names.
+
+[group:tv]
+# TV1-TV120 → 239.0.0.1 - 239.0.0.120
 prefix = TV
-# Total number of channels
+multicast_start = 239.0.0.1
 count = 120
+
+[group:radio]
+# R1-R20 → 239.0.1.1 - 239.0.1.20
+prefix = R
+multicast_start = 239.0.1.1
+count = 20
 
 [timing]
 # How often to poke Flussonic to keep stream alive (seconds)
 # MUST be less than Flussonic's on_demand timeout (30s)
 poke_interval = 20
 # Seconds to wait after IGMP leave before stopping pokes
-# Handles brief channel switches without killing the stream
 leave_grace = 5
 # HTTP request timeout for each poke (seconds)
 poke_timeout = 2
