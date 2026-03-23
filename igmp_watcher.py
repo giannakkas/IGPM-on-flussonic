@@ -128,6 +128,23 @@ def poke_stream(channel):
         return False
 
 
+def wake_stream(channel):
+    """
+    Aggressively poke a stream until it comes alive.
+    Retries every 2 seconds for up to 15 seconds.
+    This handles the delay while Flussonic connects to the SRT source.
+    """
+    for attempt in range(8):  # 8 attempts x 2s = 16s max
+        if not running:
+            return
+        success = poke_stream(channel)
+        if success:
+            log.info(f"✓ ALIVE {channel} — stream responded after {(attempt + 1) * 2}s")
+            return
+        log.debug(f"Wake {channel}: attempt {attempt + 1}/8, retrying in 2s...")
+        time.sleep(2)
+
+
 # ── Stream Tracker ──────────────────────────────────────────────
 class StreamTracker:
     def __init__(self):
@@ -144,7 +161,7 @@ class StreamTracker:
                     "leave_time": None,
                     "last_seen": now,
                 }
-                threading.Thread(target=poke_stream, args=(channel,), daemon=True).start()
+                threading.Thread(target=wake_stream, args=(channel,), daemon=True).start()
             else:
                 info = self.streams[channel]
                 if not info["active"] or info["leave_time"] is not None:
