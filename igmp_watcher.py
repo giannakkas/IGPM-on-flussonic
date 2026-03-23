@@ -13,6 +13,10 @@ on_demand timeout shuts down the stream.
 Supports multiple channel groups (e.g. TV + Radio) with different
 multicast ranges and prefixes.
 
+Watchdog: if no IGMP report is seen for a channel within
+WATCHDOG_TIMEOUT seconds, the channel is assumed dead (handles
+MAG crashes, power loss, etc. where no IGMP leave is sent).
+
 Requirements:
   - Python 3.6+
   - Must run as root (raw sockets for IGMP sniffing)
@@ -43,13 +47,14 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.i
 config = configparser.ConfigParser()
 config.read(CONFIG_PATH)
 
-INTERFACE       = config.get('network', 'interface', fallback='eth0')
-FLUSSONIC_BASE  = config.get('flussonic', 'url', fallback='http://localhost:8080')
-FLUSSONIC_USER  = config.get('flussonic', 'user', fallback='')
-FLUSSONIC_PASS  = config.get('flussonic', 'password', fallback='')
-POKE_INTERVAL   = config.getint('timing', 'poke_interval', fallback=20)
-LEAVE_GRACE     = config.getint('timing', 'leave_grace', fallback=5)
-POKE_TIMEOUT    = config.getint('timing', 'poke_timeout', fallback=2)
+INTERFACE        = config.get('network', 'interface', fallback='eth0')
+FLUSSONIC_BASE   = config.get('flussonic', 'url', fallback='http://localhost:8080')
+FLUSSONIC_USER   = config.get('flussonic', 'user', fallback='')
+FLUSSONIC_PASS   = config.get('flussonic', 'password', fallback='')
+POKE_INTERVAL    = config.getint('timing', 'poke_interval', fallback=20)
+LEAVE_GRACE      = config.getint('timing', 'leave_grace', fallback=5)
+POKE_TIMEOUT     = config.getint('timing', 'poke_timeout', fallback=2)
+WATCHDOG_TIMEOUT = config.getint('timing', 'watchdog_timeout', fallback=180)
 
 # ── Logging ─────────────────────────────────────────────────────
 LOG_PATH = config.get('logging', 'path', fallback='/var/log/igmp-watcher.log')
@@ -66,8 +71,6 @@ logging.basicConfig(
 log = logging.getLogger('igmp-watcher')
 
 # ── Channel Groups ──────────────────────────────────────────────
-# Each group defines a multicast range -> Flussonic stream name mapping
-# Format: [group:NAME] section in config.ini
 
 class ChannelGroup:
     def __init__(self, name, prefix, multicast_start, count):
@@ -90,7 +93,6 @@ class ChannelGroup:
         return None
     
     def last_ip(self):
-        """Return the last multicast IP in this group's range."""
         return f"{self.base_ip[0]}.{self.base_ip[1]}.{self.base_ip[2]}.{self.base_ip[3] + self.count - 1}"
     
     def first_ip(self):
@@ -142,7 +144,6 @@ def poke_stream(channel):
     Send a brief HTTP request to Flussonic to wake/keepalive a stream.
     Connects to the MPEG-TS endpoint, reads a tiny amount, then closes.
     This counts as a client connection, resetting the on_demand timer.
-    Since this goes to localhost, zero network bandwidth is consumed.
     """
     url = f"{FLUSSONIC_BASE}/{channel}/mpegts"
     try:
@@ -150,7 +151,7 @@ def poke_stream(channel):
         if auth_header:
             req.add_header('Authorization', auth_header)
         resp = urlopen(req, timeout=POKE_TIMEOUT)
-        resp.read(1024)  # read just enough to trigger the stream
+        resp.read(1024)
         resp.close()
         return True
     except Exception as e:
@@ -162,22 +163,33 @@ def poke_stream(channel):
 class StreamTracker:
     """
     Tracks which multicast groups have active IGMP members.
-    Manages the lifecycle: join -> keep alive -> leave -> grace -> stop.
+    
+    Lifecycle:
+      join detected     → start poking (wake stream)
+      periodic reports   → update last_seen (keep alive)
+      leave detected    → grace period → stop poking
+      no report for Xs  → watchdog kills it (handles crashes)
     """
 
     def __init__(self):
         self.lock = threading.Lock()
+        # channel_name -> {
+        #   "active": True/False,
+        #   "leave_time": float or None,
+        #   "last_seen": float (last IGMP report timestamp),
+        # }
         self.streams = {}
 
     def handle_join(self, channel):
         """Called when an IGMP join/report is detected for a channel."""
         with self.lock:
+            now = time.time()
             if channel not in self.streams:
                 log.info(f"▶ WAKE  {channel} — IGMP join detected, poking Flussonic")
                 self.streams[channel] = {
                     "active": True,
                     "leave_time": None,
-                    "viewers": 1,
+                    "last_seen": now,
                 }
                 threading.Thread(target=poke_stream, args=(channel,), daemon=True).start()
             else:
@@ -186,7 +198,7 @@ class StreamTracker:
                     log.info(f"▶ REJOIN {channel} — cancelled pending shutdown")
                 info["active"] = True
                 info["leave_time"] = None
-                info["viewers"] = max(info["viewers"], 1)
+                info["last_seen"] = now
 
     def handle_leave(self, channel):
         """Called when an IGMP leave is detected for a channel."""
@@ -200,18 +212,28 @@ class StreamTracker:
     def get_channels_to_poke(self):
         """
         Returns list of channels that need keepalive pokes.
-        Also cleans up channels past their grace period.
+        Also cleans up channels past their grace period or watchdog timeout.
         """
         with self.lock:
             now = time.time()
             to_remove = []
 
             for ch, info in self.streams.items():
+                # Check leave grace period
                 if info["leave_time"] is not None:
                     elapsed = now - info["leave_time"]
                     if elapsed >= LEAVE_GRACE:
-                        log.info(f"⏹ STOP  {ch} — grace expired, Flussonic will shut down in ~{30 - LEAVE_GRACE}s")
+                        log.info(f"⏹ STOP  {ch} — leave grace expired")
                         to_remove.append(ch)
+                        continue
+
+                # Check watchdog — no IGMP report seen for too long
+                # This handles MAG crashes, power loss, network issues
+                since_last = now - info["last_seen"]
+                if since_last >= WATCHDOG_TIMEOUT:
+                    log.warning(f"⏹ WATCHDOG {ch} — no IGMP report for {int(since_last)}s, assuming dead")
+                    to_remove.append(ch)
+                    continue
 
             for ch in to_remove:
                 del self.streams[ch]
@@ -224,10 +246,15 @@ class StreamTracker:
     def get_status(self):
         """Returns current status for logging."""
         with self.lock:
-            active = [ch for ch, info in self.streams.items()
-                      if info["active"] and info["leave_time"] is None]
-            leaving = [ch for ch, info in self.streams.items()
-                       if info["leave_time"] is not None]
+            now = time.time()
+            active = []
+            leaving = []
+            for ch, info in self.streams.items():
+                if info["leave_time"] is not None:
+                    leaving.append(ch)
+                elif info["active"]:
+                    age = int(now - info["last_seen"])
+                    active.append(f"{ch}({age}s)")
             return active, leaving
 
 
@@ -394,14 +421,15 @@ def main():
     
     log.info("=" * 60)
     log.info("IGMP Watcher for Flussonic — Starting")
-    log.info(f"  Interface:    {INTERFACE}")
-    log.info(f"  Flussonic:    {FLUSSONIC_BASE}")
-    log.info(f"  Groups:       {len(channel_groups)}")
+    log.info(f"  Interface:      {INTERFACE}")
+    log.info(f"  Flussonic:      {FLUSSONIC_BASE}")
+    log.info(f"  Groups:         {len(channel_groups)}")
     for g in channel_groups:
         log.info(f"    {g.name}: {g.prefix}1-{g.prefix}{g.count} → {g.first_ip()}-{g.last_ip()}")
-    log.info(f"  Total:        {total_channels} channels")
-    log.info(f"  Poke every:   {POKE_INTERVAL}s")
-    log.info(f"  Leave grace:  {LEAVE_GRACE}s")
+    log.info(f"  Total:          {total_channels} channels")
+    log.info(f"  Poke every:     {POKE_INTERVAL}s")
+    log.info(f"  Leave grace:    {LEAVE_GRACE}s")
+    log.info(f"  Watchdog:       {WATCHDOG_TIMEOUT}s (kills stale channels)")
     log.info("=" * 60)
 
     if POKE_INTERVAL >= 30:

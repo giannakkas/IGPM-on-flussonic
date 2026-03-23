@@ -34,6 +34,11 @@ poke_interval = 20
 leave_grace = 5
 # HTTP request timeout for each poke (seconds)
 poke_timeout = 2
+# If no IGMP report seen for a channel in this many seconds,
+# assume all viewers are gone (handles MAG crash/power loss).
+# Switch IGMP query interval is typically 60-125s, so 180s
+# gives 2-3 missed queries before killing the stream.
+watchdog_timeout = 180
 
 [logging]
 path = /var/log/igmp-watcher.log
