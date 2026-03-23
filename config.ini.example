@@ -29,7 +29,7 @@ count = 20
 [timing]
 # How often to poke Flussonic to keep stream alive (seconds)
 # MUST be less than Flussonic's on_demand timeout (30s)
-poke_interval = 20
+poke_interval = 15
 # Seconds to wait after IGMP leave before stopping pokes
 leave_grace = 5
 # HTTP request timeout for each poke (seconds)

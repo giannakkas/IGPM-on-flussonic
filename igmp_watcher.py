@@ -114,13 +114,23 @@ if FLUSSONIC_USER:
 
 
 def poke_stream(channel):
+    """
+    Keep an HTTP MPEG-TS connection open for a few seconds.
+    This registers as a real client in Flussonic, resetting on_demand.
+    """
     url = f"{FLUSSONIC_BASE}/{channel}/mpegts"
     try:
         req = Request(url)
         if auth_header:
             req.add_header('Authorization', auth_header)
-        resp = urlopen(req, timeout=POKE_TIMEOUT)
-        resp.read(1024)
+        resp = urlopen(req, timeout=10)
+        # Read data for 5 seconds to stay registered as a client
+        start = time.time()
+        while time.time() - start < 5:
+            chunk = resp.read(4096)
+            if not chunk:
+                break
+            time.sleep(0.5)
         resp.close()
         return True
     except Exception as e:
